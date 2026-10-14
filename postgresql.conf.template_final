@@ -1,0 +1,16 @@
+listen_addresses = '*'
+port = 5432
+max_connections = 100
+shared_buffers = 256MB
+
+wal_level = replica
+
+# По умолчанию archive_mode = off (WALG_ARCHIVE не задан).
+# Включается только при WALG_ARCHIVE=1.
+archive_mode = ${PG_ARCHIVE_MODE}
+archive_timeout = ${PG_ARCHIVE_TIMEOUT}
+archive_command = '${PG_ARCHIVE_COMMAND}'
+restore_command = '${PG_RESTORE_COMMAND}'
+
+logging_collector = off
+log_min_duration_statement = 1000
