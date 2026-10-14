@@ -1,0 +1,13 @@
+listen_addresses = '*'
+port = 5432
+max_connections = 100
+shared_buffers = 256MB
+
+wal_level = replica
+archive_mode = on
+archive_timeout = 60
+archive_command = 'wal-g wal-push %p'
+restore_command = 'wal-g wal-fetch %f %p'
+
+logging_collector = off
+log_min_duration_statement = 1000
