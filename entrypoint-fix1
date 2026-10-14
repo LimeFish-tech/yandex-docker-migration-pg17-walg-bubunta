@@ -1,0 +1,48 @@
+#!/bin/bash
+set -euo pipefail
+
+PGDATA="${PGDATA:-/var/lib/postgresql/17/main}"
+PG_BIN="/usr/lib/postgresql/17/bin"
+
+# --- 1. Инициализация кластера (СТРОГО до любых записей в PGDATA) ---
+if [ ! -s "${PGDATA}/PG_VERSION" ]; then
+    echo ">>> Инициализация кластера PostgreSQL..."
+    mkdir -p "${PGDATA}"
+    chmod 700 "${PGDATA}"
+
+    PWFILE="$(mktemp)"
+    echo "${POSTGRES_PASSWORD:-postgres}" > "${PWFILE}"
+
+    "${PG_BIN}/initdb" \
+        --username="${POSTGRES_USER:-postgres}" \
+        --pwfile="${PWFILE}" \
+        --auth-local=trust \
+        --auth-host=scram-sha-256 \
+        --encoding=UTF8 \
+        --locale=en_US.UTF-8
+
+    rm -f "${PWFILE}"
+    echo ">>> Инициализация завершена."
+fi
+
+# --- 2. Применяем наш шаблон конфига (поверх postgresql.conf от initdb) ---
+if [ -f /etc/postgresql/17/main/postgresql.conf.template ]; then
+    envsubst < /etc/postgresql/17/main/postgresql.conf.template > "${PGDATA}/postgresql.conf"
+fi
+
+# --- 3. Временный запуск для создания базы ---
+"${PG_BIN}/pg_ctl" -D "${PGDATA}" \
+    -o "-c config_file=${PGDATA}/postgresql.conf" -w start
+
+if [ -n "${POSTGRES_DB:-}" ]; then
+    if ! "${PG_BIN}/psql" -U "${POSTGRES_USER:-postgres}" -lqt \
+            | cut -d'|' -f1 | grep -qw "${POSTGRES_DB}"; then
+        "${PG_BIN}/createdb" -U "${POSTGRES_USER:-postgres}" "${POSTGRES_DB}"
+    fi
+fi
+
+"${PG_BIN}/pg_ctl" -D "${PGDATA}" -m fast stop
+
+# --- 4. Основной запуск ---
+echo ">>> Запуск PostgreSQL..."
+exec "${PG_BIN}/postgres" -D "${PGDATA}" -c config_file="${PGDATA}/postgresql.conf"
