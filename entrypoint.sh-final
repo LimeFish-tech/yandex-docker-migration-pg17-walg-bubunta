@@ -12,16 +12,20 @@ PG_PASSWORD="${POSTGRES_PASSWORD:-postgres}"
 TEMPLATE="/etc/postgresql/17/main/postgresql.conf.template"
 
 # Флаги поведения
-ALLOW_REINIT="${ALLOW_REINIT:-0}"        # 1 = разрешить переинициализацию битого кластера
-WALG_RESTORE="${WALG_RESTORE:-0}"        # 1 = восстановить из WAL-G и не делать initdb
-WALG_RESTORE_STRIP="${WALG_RESTORE_STRIP:-0}"  # 1 = использовать --strip-components=1 при распаковке tar
+ALLOW_REINIT="${ALLOW_REINIT:-0}"              # 1 = разрешить переинициализацию битого кластера
+WALG_RESTORE="${WALG_RESTORE:-0}"              # 1 = восстановить из WAL-G
+WALG_ARCHIVE="${WALG_ARCHIVE:-0}"              # 1 = включить архивацию WAL-G (по умолчанию ВЫКЛ!)
+WALG_RESTORE_STRIP="${WALG_RESTORE_STRIP:-0}"  # 1 = --strip-components=1 при распаковке tar
+FORCE_CONFIG_TEMPLATE="${FORCE_CONFIG_TEMPLATE:-0}"  # 1 = применить шаблон даже поверх restored-кластера
+
+RESTORE_MARKER="${PGDATA}/.walg-restored"
 
 LOG_PREFIX="[entrypoint]"
 log()  { echo "${LOG_PREFIX} $*"; }
 die()  { echo "${LOG_PREFIX} FATAL: $*" >&2; exit 1; }
 
 # ==================================================================
-# 0. Санити-чеки окружения
+# 0. Санити-чеки
 # ==================================================================
 [ -x "${PG_BIN}/initdb" ]   || die "initdb не найден в ${PG_BIN}"
 [ -x "${PG_BIN}/pg_ctl" ]   || die "pg_ctl не найден в ${PG_BIN}"
@@ -32,8 +36,27 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 # ==================================================================
-# 1. Проверка валидности кластера
-#    Возвращает 0, если кластер полный и пригодный к запуску.
+# 1. Подготовка переменных для шаблона конфига
+#    По умолчанию ВСЁ, что связано с WAL-G-архивацией, выключено.
+#    Включается только при WALG_ARCHIVE=1.
+# ==================================================================
+prepare_config_vars() {
+    if [ "${WALG_ARCHIVE}" = "1" ]; then
+        log ">>> WALG_ARCHIVE=1 — включаю архивацию WAL через WAL-G."
+        export PG_ARCHIVE_MODE="on"
+        export PG_ARCHIVE_COMMAND="wal-g wal-push %p"
+        export PG_RESTORE_COMMAND="wal-g wal-fetch %f %p"
+    else
+        log ">>> WALG_ARCHIVE не задан — архивация WAL отключена (archive_mode=off)."
+        export PG_ARCHIVE_MODE="off"
+        export PG_ARCHIVE_COMMAND="/bin/true"
+        export PG_RESTORE_COMMAND="/bin/true"
+    fi
+    export PG_ARCHIVE_TIMEOUT="${PG_ARCHIVE_TIMEOUT:-60}"
+}
+
+# ==================================================================
+# 2. Проверка валидности кластера
 # ==================================================================
 cluster_is_valid() {
     [ -s "${PGDATA}/PG_VERSION" ]      || return 1
@@ -46,7 +69,7 @@ cluster_is_valid() {
 }
 
 # ==================================================================
-# 2. Проверка прав на PGDATA
+# 3. Проверка прав
 # ==================================================================
 check_permissions() {
     if [ -e "${PGDATA}" ]; then
@@ -59,7 +82,7 @@ check_permissions() {
 }
 
 # ==================================================================
-# 3. Восстановление из WAL-G (с поддержкой tar.br)
+# 4. Восстановление из WAL-G (с поддержкой tar.br)
 # ==================================================================
 restore_from_walg() {
     log ">>> Режим восстановления из WAL-G (WALG_RESTORE=1)"
@@ -69,18 +92,13 @@ restore_from_walg() {
     command -v brotli >/dev/null || die "brotli не найден в PATH (нужен для распаковки .br)"
     command -v tar    >/dev/null || die "tar не найден в PATH"
 
-    # PGDATA должен быть пуст
     mkdir -p "${PGDATA}"
     chmod 700 "${PGDATA}"
     if [ -n "$(ls -A "${PGDATA}" 2>/dev/null || true)" ]; then
         die "PGDATA=${PGDATA} не пуст. Очистите том перед восстановлением."
     fi
 
-    # ------------------------------------------------------------------
-    # Ключевая настройка: как WAL-G должен распаковывать поток
-    # Если бэкап — это tar.br, распаковываем brotli + tar прямо в PGDATA.
-    # WALG_STREAM_RESTORE_COMMAND получает данные на STDIN.
-    # ------------------------------------------------------------------
+    # Как WAL-G должен распаковывать поток
     if [ "${WALG_RESTORE_STRIP}" = "1" ]; then
         log ">>> Использую --strip-components=1 (архив содержит подкаталог)"
         export WALG_STREAM_RESTORE_COMMAND="brotli -d -c | tar -xf - -C ${PGDATA} --strip-components=1"
@@ -92,28 +110,37 @@ restore_from_walg() {
     log ">>> wal-g backup-fetch ${backup_name}"
     wal-g backup-fetch "${PGDATA}" "${backup_name}"
 
-    # ------------------------------------------------------------------
     # recovery.signal — для PostgreSQL 12+
-    # ------------------------------------------------------------------
     touch "${PGDATA}/recovery.signal"
 
     # ------------------------------------------------------------------
-    # Параметры восстановления в postgresql.auto.conf
+    # КРИТИЧНО: в postgresql.auto.conf пишем настройки, которые
+    # перекрывают всё, что могло прийти из бэкапа.
+    # В частности — принудительно ВЫКЛЮЧАЕМ архивацию, чтобы после
+    # promote восстановленный кластер не начал пушить WAL обратно
+    # в бэкап-репозиторий и не испортил его.
     # ------------------------------------------------------------------
     {
+        echo "# --- Сгенерировано entrypoint.sh при восстановлении ---"
+        echo "archive_mode = off"
+        echo "archive_command = ''"
         echo "restore_command = 'wal-g wal-fetch %f %p'"
         echo "recovery_target_timeline = 'latest'"
         if [ -n "${WALG_RECOVERY_TARGET_TIME:-}" ]; then
             echo "recovery_target_time = '${WALG_RECOVERY_TARGET_TIME}'"
         fi
         echo "recovery_target_action = 'promote'"
+        echo "listen_addresses = '*'"
     } >> "${PGDATA}/postgresql.auto.conf"
 
-    log ">>> Восстановление завершено, PostgreSQL будет запущен в режиме recovery."
+    # Маркер: кластер восстановлен, шаблон конфига поверх не применять
+    touch "${RESTORE_MARKER}"
+
+    log ">>> Восстановление завершено. Архивация WAL принудительно выключена."
 }
 
 # ==================================================================
-# 4. Инициализация кластера
+# 5. Инициализация кластера
 # ==================================================================
 init_cluster() {
     log ">>> Инициализация кластера PostgreSQL в ${PGDATA}..."
@@ -139,7 +166,7 @@ init_cluster() {
 }
 
 # ==================================================================
-# 5. Применение шаблона postgresql.conf
+# 6. Применение шаблона postgresql.conf
 # ==================================================================
 apply_config_template() {
     if [ ! -f "${TEMPLATE}" ]; then
@@ -152,13 +179,14 @@ apply_config_template() {
     fi
 
     log ">>> Применяю шаблон конфига ${TEMPLATE}"
-    envsubst < "${TEMPLATE}" > "${PGDATA}/postgresql.conf"
+    envsubst '${PG_ARCHIVE_MODE} ${PG_ARCHIVE_TIMEOUT} ${PG_ARCHIVE_COMMAND} ${PG_RESTORE_COMMAND}' \
+        < "${TEMPLATE}" > "${PGDATA}/postgresql.conf"
 
     [ -s "${PGDATA}/postgresql.conf" ] || die "postgresql.conf получился пустым после envsubst"
 }
 
 # ==================================================================
-# 6. Создание БД (если нужно) через временный запуск
+# 7. Создание БД (если нужно)
 # ==================================================================
 ensure_database() {
     [ -n "${PG_DB}" ] || { log ">>> POSTGRES_DB не задан, пропускаю создание БД."; return 0; }
@@ -175,7 +203,7 @@ ensure_database() {
 }
 
 # ==================================================================
-# 7. Временный запуск / остановка
+# 8. Временный запуск / остановка
 # ==================================================================
 start_temp() {
     "${PG_BIN}/pg_ctl" -D "${PGDATA}" \
@@ -195,7 +223,7 @@ stop_temp() {
 }
 
 # ==================================================================
-# 8. Корректная обработка сигналов
+# 9. Обработка сигналов
 # ==================================================================
 on_signal() {
     log ">>> Получен сигнал, останавливаю PostgreSQL..."
@@ -207,6 +235,7 @@ on_signal() {
 # Основной сценарий
 # ==================================================================
 check_permissions
+prepare_config_vars
 
 mkdir -p /var/run/postgresql 2>/dev/null || true
 
@@ -222,7 +251,7 @@ else
             rm -rf "${PGDATA:?}"/*
             init_cluster
         else
-            die "Кластер в ${PGDATA} неполный (нет pg_hba.conf или других файлов). Удалите том или запустите с ALLOW_REINIT=1."
+            die "Кластер в ${PGDATA} неполный. Удалите том или запустите с ALLOW_REINIT=1."
         fi
     else
         init_cluster
@@ -230,12 +259,17 @@ else
 fi
 
 # --- B. Применяем шаблон конфига ---
-# В режиме восстановления НЕ перезаписываем postgresql.conf,
-# чтобы не потерять настройки, которые могли прийти из бэкапа.
-if [ "${WALG_RESTORE}" != "1" ]; then
-    apply_config_template
+# Не применяем шаблон, если:
+#   - мы только что восстановились (маркер .walg-restored), или
+#   - уже есть маркер восстановления от предыдущего запуска,
+#     и пользователь явно не потребовал обратного (FORCE_CONFIG_TEMPLATE=1).
+if [ "${WALG_RESTORE}" = "1" ]; then
+    log ">>> Режим восстановления: шаблон конфига не применяю."
+elif [ -f "${RESTORE_MARKER}" ] && [ "${FORCE_CONFIG_TEMPLATE}" != "1" ]; then
+    log ">>> Обнаружен маркер восстановления (${RESTORE_MARKER}) — шаблон конфига не применяю."
+    log ">>> Архивация WAL остаётся выключенной (см. postgresql.auto.conf)."
 else
-    log ">>> Режим восстановления: шаблон конфига не применяю, использую конфиг из бэкапа."
+    apply_config_template
 fi
 
 # --- C. Временный запуск и создание БД ---
