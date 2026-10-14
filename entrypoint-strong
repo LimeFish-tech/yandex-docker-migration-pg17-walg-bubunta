@@ -1,0 +1,233 @@
+#!/bin/bash
+set -euo pipefail
+
+# ------------------------------------------------------------------
+# Настройки (можно переопределить через env)
+# ------------------------------------------------------------------
+PGDATA="${PGDATA:-/var/lib/postgresql/17/main}"
+PG_BIN="${PG_BIN:-/usr/lib/postgresql/17/bin}"
+PG_USER="${POSTGRES_USER:-postgres}"
+PG_DB="${POSTGRES_DB:-}"
+PG_PASSWORD="${POSTGRES_PASSWORD:-postgres}"
+TEMPLATE="/etc/postgresql/17/main/postgresql.conf.template"
+
+# Флаги поведения
+ALLOW_REINIT="${ALLOW_REINIT:-0}"        # 1 = разрешить переинициализацию битого кластера
+WALG_RESTORE="${WALG_RESTORE:-0}"        # 1 = восстановить из WAL-G и не делать initdb
+
+LOG_PREFIX="[entrypoint]"
+log()  { echo "${LOG_PREFIX} $*"; }
+die()  { echo "${LOG_PREFIX} FATAL: $*" >&2; exit 1; }
+
+# ------------------------------------------------------------------
+# 0. Санити-чеки окружения
+# ------------------------------------------------------------------
+[ -x "${PG_BIN}/initdb" ]  || die "initdb не найден в ${PG_BIN}"
+[ -x "${PG_BIN}/pg_ctl" ]  || die "pg_ctl не найден в ${PG_BIN}"
+[ -x "${PG_BIN}/postgres" ] || die "postgres не найден в ${PG_BIN}"
+
+if [ "$(id -u)" = "0" ]; then
+    die "entrypoint.sh нельзя запускать от root. Запускайте от пользователя postgres."
+fi
+
+# ------------------------------------------------------------------
+# 1. Функция проверки валидности кластера
+#    Возвращает 0, если кластер полный и пригодный к запуску.
+# ------------------------------------------------------------------
+cluster_is_valid() {
+    [ -s "${PGDATA}/PG_VERSION" ]    || return 1
+    [ -s "${PGDATA}/pg_hba.conf" ]   || return 1
+    [ -s "${PGDATA}/postgresql.conf" ] || return 1
+    [ -d "${PGDATA}/base" ]          || return 1
+    [ -d "${PGDATA}/global" ]        || return 1
+    [ -d "${PGDATA}/pg_wal" ]        || return 1
+    return 0
+}
+
+# ------------------------------------------------------------------
+# 2. Проверка прав на PGDATA
+# ------------------------------------------------------------------
+check_permissions() {
+    if [ -e "${PGDATA}" ]; then
+        local owner
+        owner="$(stat -c '%U' "${PGDATA}" 2>/dev/null || echo '?')"
+        if [ "${owner}" != "$(id -un)" ]; then
+            die "PGDATA=${PGDATA} принадлежит '${owner}', а мы работаем от '$(id -un)'. Исправьте права или удалите том."
+        fi
+    fi
+}
+
+# ------------------------------------------------------------------
+# 3. Восстановление из WAL-G (если запрошено)
+# ------------------------------------------------------------------
+restore_from_walg() {
+    log ">>> Режим восстановления из WAL-G (WALG_RESTORE=1)"
+    [ -n "${WALG_STORAGE_PREFIX:-}" ] || die "WALG_STORAGE_PREFIX не задан"
+    command -v wal-g >/dev/null || die "wal-g не найден в PATH"
+
+    # PGDATA должен быть пуст (кроме, может быть, потерянных файлов)
+    mkdir -p "${PGDATA}"
+    chmod 700 "${PGDATA}"
+    if [ -n "$(ls -A "${PGDATA}" 2>/dev/null || true)" ]; then
+        die "PGDATA=${PGDATA} не пуст. Очистите том перед восстановлением."
+    fi
+
+    local backup_name="${WALG_BACKUP_NAME:-LATEST}"
+    log ">>> wal-g backup-fetch ${backup_name}"
+    wal-g backup-fetch "${PGDATA}" "${backup_name}"
+
+    # recovery.signal — для PostgreSQL 12+
+    touch "${PGDATA}/recovery.signal"
+
+    # Опциональные параметры восстановления
+    if [ -n "${WALG_RECOVERY_TARGET_TIME:-}" ]; then
+        {
+            echo "restore_command = 'wal-g wal-fetch %f %p'"
+            echo "recovery_target_time = '${WALG_RECOVERY_TARGET_TIME}'"
+            echo "recovery_target_action = 'promote'"
+        } >> "${PGDATA}/postgresql.auto.conf"
+    fi
+
+    log ">>> Восстановление завершено, будет запущен recovery."
+}
+
+# ------------------------------------------------------------------
+# 4. Инициализация кластера
+# ------------------------------------------------------------------
+init_cluster() {
+    log ">>> Инициализация кластера PostgreSQL в ${PGDATA}..."
+    mkdir -p "${PGDATA}"
+    chmod 700 "${PGDATA}"
+
+    local pwfile
+    pwfile="$(mktemp)"
+    # shellcheck disable=SC2064
+    trap "rm -f '${pwfile}'" RETURN
+    printf '%s\n' "${PG_PASSWORD}" > "${pwfile}"
+
+    "${PG_BIN}/initdb" \
+        --username="${PG_USER}" \
+        --pwfile="${pwfile}" \
+        --auth-local=trust \
+        --auth-host=scram-sha-256 \
+        --encoding=UTF8 \
+        --locale=en_US.UTF-8 \
+        -D "${PGDATA}"
+
+    log ">>> Инициализация завершена."
+}
+
+# ------------------------------------------------------------------
+# 5. Применение шаблона postgresql.conf
+# ------------------------------------------------------------------
+apply_config_template() {
+    if [ ! -f "${TEMPLATE}" ]; then
+        log ">>> Шаблон ${TEMPLATE} не найден, оставляю конфиг от initdb."
+        return 0
+    fi
+
+    # Резервная копия текущего конфига (на случай отладки)
+    if [ -f "${PGDATA}/postgresql.conf" ]; then
+        cp -a "${PGDATA}/postgresql.conf" "${PGDATA}/postgresql.conf.bak" || true
+    fi
+
+    log ">>> Применяю шаблон конфига ${TEMPLATE}"
+    envsubst < "${TEMPLATE}" > "${PGDATA}/postgresql.conf"
+
+    # Валидация: conf не должен быть пустым
+    [ -s "${PGDATA}/postgresql.conf" ] || die "postgresql.conf получился пустым после envsubst"
+}
+
+# ------------------------------------------------------------------
+# 6. Создание БД (если нужно) через временный запуск
+# ------------------------------------------------------------------
+ensure_database() {
+    [ -n "${PG_DB}" ] || { log ">>> POSTGRES_DB не задан, пропускаю создание БД."; return 0; }
+
+    log ">>> Проверяю наличие БД '${PG_DB}'..."
+    if "${PG_BIN}/psql" -U "${PG_USER}" -d postgres -tAc \
+         "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" | grep -q 1; then
+        log ">>> БД '${PG_DB}' уже существует."
+        return 0
+    fi
+
+    log ">>> Создаю БД '${PG_DB}'..."
+    "${PG_BIN}/createdb" -U "${PG_USER}" "${PG_DB}"
+}
+
+# ------------------------------------------------------------------
+# 7. Управление временным запуском
+# ------------------------------------------------------------------
+start_temp() {
+    "${PG_BIN}/pg_ctl" -D "${PGDATA}" \
+        -o "-c config_file=${PGDATA}/postgresql.conf -c listen_addresses=''" \
+        -w -t 60 start
+
+    # Ждём готовности
+    local i=0
+    until "${PG_BIN}/pg_isready" -q -h /var/run/postgresql -U "${PG_USER}" ; do
+        i=$((i+1))
+        [ "$i" -lt 60 ] || die "PostgreSQL не поднялся за 60 секунд"
+        sleep 1
+    done
+}
+
+stop_temp() {
+    "${PG_BIN}/pg_ctl" -D "${PGDATA}" -m fast -w -t 60 stop || true
+}
+
+# ------------------------------------------------------------------
+# 8. Корректная обработка сигналов
+# ------------------------------------------------------------------
+SHUTDOWN_REQUESTED=0
+on_signal() {
+    SHUTDOWN_REQUESTED=1
+    log ">>> Получен сигнал, останавливаю PostgreSQL..."
+    "${PG_BIN}/pg_ctl" -D "${PGDATA}" -m fast -w -t 60 stop || true
+    exit 0
+}
+
+# ==================================================================
+# Основной сценарий
+# ==================================================================
+check_permissions
+
+mkdir -p /var/run/postgresql 2>/dev/null || true
+
+# --- A. Восстановление или инициализация ---
+if [ "${WALG_RESTORE}" = "1" ]; then
+    restore_from_walg
+elif cluster_is_valid; then
+    log ">>> Найден валидный кластер в ${PGDATA}, инициализация не требуется."
+else
+    if [ -e "${PGDATA}/PG_VERSION" ]; then
+        # Есть признаки кластера, но он неполный
+        if [ "${ALLOW_REINIT}" = "1" ]; then
+            log ">>> Кластер неполный, ALLOW_REINIT=1 — переинициализирую."
+            rm -rf "${PGDATA:?}"/*
+            init_cluster
+        else
+            die "Кластер в ${PGDATA} неполный (нет pg_hba.conf или других файлов). Удалите том или запустите с ALLOW_REINIT=1."
+        fi
+    else
+        init_cluster
+    fi
+fi
+
+# --- B. Применяем шаблон конфига (поверх initdb) ---
+apply_config_template
+
+# --- C. Временный запуск, создание БД, остановка ---
+if [ "${WALG_RESTORE}" != "1" ]; then
+    start_temp
+    ensure_database
+    stop_temp
+else
+    log ">>> В режиме восстановления создание БД пропущено — БД возьмутся из бэкапа."
+fi
+
+# --- D. Основной запуск ---
+trap on_signal SIGTERM SIGINT SIGQUIT
+
+log ">>> Запуск PostgreSQL (foreground)..."
+exec "${PG_BIN}/postgres" -D "${PGDATA}" -c config_file="${PGDATA}/postgresql.conf"
