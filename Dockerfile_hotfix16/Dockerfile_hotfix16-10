@@ -1,0 +1,103 @@
+FROM ubuntu:24.04
+
+LABEL maintainer="you@example.com" \
+      description="Ubuntu 24.04 + PostgreSQL 17 + WAL-G + all UTF-8 locales"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    LANGUAGE=en_US:en \
+    PGDATA=/var/lib/postgresql/17/main
+
+# ------------------------------------------------------------------
+# Базовые пакеты + locales
+# ------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        brotli \
+        ca-certificates \
+        curl \
+        gettext-base \
+        gnupg \
+        locales \
+        lsb-release \
+        tini \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------------
+# Включаем ВСЕ UTF-8 локали и генерируем их.
+#
+# 1. Раскомментируем в /etc/locale.gen все строки, содержащие UTF-8.
+# 2. Отдельно гарантируем наличие en_US.UTF-8 и ru_RU.UTF-8 —
+#    они нужны всегда, даже если их вдруг не было в locale.gen.
+# 3. Запускаем locale-gen.
+#
+# Так в контейнере будут доступны и ru_RU.UTF-8, и en_US.UTF-8,
+# и все прочие варианты (de_DE.UTF-8, fr_FR.UTF-8, uk_UA.UTF-8, ...),
+# чтобы восстановление бэкапа с любой локалью прошло без ошибок.
+# ------------------------------------------------------------------
+RUN set -eux; \
+    sed -i -e 's/^# *\(.*UTF-8\)$/\1/' /etc/locale.gen; \
+    grep -q '^en_US.UTF-8 UTF-8' /etc/locale.gen || echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen; \
+    grep -q '^ru_RU.UTF-8 UTF-8' /etc/locale.gen || echo 'ru_RU.UTF-8 UTF-8' >> /etc/locale.gen; \
+    locale-gen; \
+    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# Проверка: локали должны быть видны системе
+RUN locale -a | tee /tmp/locales.txt && \
+    grep -qx 'en_US.utf8' /tmp/locales.txt && \
+    grep -qx 'ru_RU.utf8' /tmp/locales.txt && \
+    rm -f /tmp/locales.txt
+
+# ------------------------------------------------------------------
+# Репозиторий PGDG (в Ubuntu 24.04 только PostgreSQL 16, нам нужен 17)
+# ------------------------------------------------------------------
+RUN install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+        http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list
+
+# ------------------------------------------------------------------
+# PostgreSQL 17
+# ------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        postgresql-17 \
+        postgresql-client-17 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------------
+# WAL-G
+# ------------------------------------------------------------------
+ARG WALG_VERSION=v3.0.8
+ARG WALG_ASSET=wal-g-pg-24.04-amd64
+RUN set -eux; \
+    cd /tmp; \
+    curl -fsSLO "https://github.com/wal-g/wal-g/releases/download/${WALG_VERSION}/${WALG_ASSET}"; \
+    curl -fsSLO "https://github.com/wal-g/wal-g/releases/download/${WALG_VERSION}/${WALG_ASSET}.sha256"; \
+    sha256sum -c "${WALG_ASSET}.sha256"; \
+    install -m 0755 "${WALG_ASSET}" /usr/local/bin/wal-g; \
+    rm -f "${WALG_ASSET}" "${WALG_ASSET}.sha256"; \
+    wal-g --version
+
+# ------------------------------------------------------------------
+# Каталоги данных
+# ------------------------------------------------------------------
+RUN mkdir -p /var/lib/postgresql/17/main /var/run/postgresql \
+    && chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql \
+    && chmod 700 /var/lib/postgresql/17/main
+
+# ------------------------------------------------------------------
+# Entrypoint и конфиг
+# ------------------------------------------------------------------
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY postgresql.conf.template /etc/postgresql/17/main/postgresql.conf.template
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+EXPOSE 5432
+VOLUME ["/var/lib/postgresql/17/main"]
+
+USER postgres
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+CMD ["postgres"]
